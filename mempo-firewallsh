@@ -1,0 +1,531 @@
+!/bin/bash -e
+
+# simple firewall version 2.x (possibly with edited local configuration here)
+# author: maintained by: rfree - github.com/rfree/
+
+# base code by:
+# by tuxguy - freenet/fms Identity: SSK@lRke4fhCLOHbCn-D0~1dKBPVg08oLB5K-avTEkWWmjg,jB6oKGWv07-5RuDHletDPIJbiLDSbOShvPnClFw4EdY,AQACAAE/
+# Copyrighted 2012. BSD Licence.
+# freenet site (freesite, use freenetproject.org software to access it) is located on URL:
+# freenet:USK@LdlyLrarSH~gin8K5iJcsPagkq33ICMyfO1jysGH4DA,Q22eGrV5MVWCE123WY3LJ4e7CIX1lt1kw6N2Fe~ir88,AQACAAE/tuxguy/-1/#firewall-1
+
+
+# READ THIS WARNING:
+# Before using this script - do search/grep for "configure" and "scret".  Also before sharing/posting improvments to this post remove such data.
+# Review entire script yourself it will run as root.
+# Tie this script into init.d or similar autostart mechanism later.
+
+# This is the general firewall for a workstation, but also tuned up for services / privacy and privacy networks
+# - basic rules
+# - freenet with strong isolation between services (node, fms, etc) and multiple node(s) and limitng to eth+ / usb0 etc
+# - yacy on TOR
+# - some isolated users (e.g. user with no network / or user on TOR only) 
+# - separate users only can access protected-services (e.g. freenet :8888 or fms :8080 and so on). sudo sux into this users
+
+# For security of system, services like tor, freenet, i2p, yacy, bitcoin, and so on should run on separate LINUX users.
+# Then we can isolate users from eachother and parts of system and networks based on user id (uid, gid) - this is done
+# by this firewall.
+
+# Separation:
+# Each server has separte user srv_*, as well as separate "client" user srv_*_cli that access it's server only.
+#
+# E.g. srv_fn should be accessibly only from localhost only from user srv_fn_cli, and srv_fn_cli can only access Freenet (and maybe TOR)
+# Then e.g. you and your roomate can "sudo sux srv_fn_cli" and use Freenet, while guests, or even compromised accounts (e.g. exploit in other
+# server like srv_yacy) can not access your data (so easily) of other services.
+#
+# Servers so far:
+# You can have freenet node(s) that are opennet or hybrid (connect to anyone)
+# You can have freenet node(s) that are darknet (connect to just selected target IP:port)
+# You can have Yacy server and confine it to TOR
+# You can have freenet-based servers like FMS, FLIP.  And client _cli users for such local services.
+# You can have user(s) that are either confinded to TOR or completely separated from networking outside of computer
+# Adding more services should be similar.
+# In this versions all groups are interconnected: srv_fn2_cli -> srv_fn1, but it could be upgraded to more strict
+# then you could setup many (freenet+fms+flip) accounts completly isolated from other such groups.
+
+# Script todo:
+# TODO: allow empty "" parameters resulting in skipping options like -o ... 
+# TODO: use real arrays and define them on top. Ideally configuration could be separated out from the script itself.
+
+# Iptable rules todo:
+# TODO: antispoof rule
+# TODO: some logging should use hashmaps. e.g. to log (once given person) who tries to connect without autorization to protected-services
+# TODO: use some limiting for actuall connections maybe to avoid FLOOD / simple DDoS (e.g. to freenet ports)
+# TODO: use general simple antiflood methods
+# TODO: we use flag=8000 to mark spam messages. 1) can we do it without modifying the packet?  2) better use the flag only ON flood not non-flood but limit does not work with inverse rules
+
+# LOGS: Read log with dmesg -c and there look for:
+#
+# fw_... firewall log message
+# fwSPAM_... this message was spamming - this is the last message (from given rule) for some configured time, other logs are skipped to stop flood
+#
+# STOP_    - general blocking
+# S_       - more blocking
+# H - HOLD - local protected-service is holded from going out / into unauthorized places
+# Hign     - ignore(block) common missbehaviour of holded protected-service. e.g. when it attempts to use DNS.
+# PROT_out - local program is blocked from going *out* into the protected-service (probably lo->lo connection)
+# PROT_in  - any access *into* protected-service is blocked (so probably ext->lo, because lo->lo is allowed if not stopped by _out)
+#
+
+echo "Starting firewall"
+
+
+# === the STATIC PART (library?) ==================================================================
+
+# a shortcut:
+function iptab() {
+	printf "  iptables: %s\n" "$*"
+	iptables $* || { echo "ERROR while doing: iptables $*" ; echo "STOP because the error." ; exit 1 ; }
+}
+function iptab_hidden() {
+	printf "  iptables: (hidden rule) \n" 
+	iptables $* || { 
+		echo "ERROR while doing: iptables (hidden rule - edit iptab_hidden to see hidden rules on error)" ; 
+		printf "iptables ERROR was on: %s\n" "$*"  # <--- XXX temporarly uncomment this to see what caused error
+		echo "STOP because the error." ; exit 1 ; 
+	}
+}
+
+function block_everything() {
+	iptab -A INPUT   -j DROP
+	iptab -A OUTPUT  -j DROP
+	iptab -A FORWARD -j DROP
+}
+
+function block_everything_undo() {
+	iptab -D INPUT   -j DROP
+	iptab -D OUTPUT  -j DROP
+	iptab -D FORWARD -j DROP
+}
+
+function clear_firewall() {
+	for tab in filter mangle nat raw 
+	do
+		iptab  -t $tab  -F
+		iptab  -t $tab  -X
+		iptab  -t $tab  -Z
+	done
+
+# temporary polices while loading.
+	iptab  -P INPUT     DROP
+	iptab  -P OUTPUT    DROP
+	iptab  -P FORWARD   DROP
+}
+
+
+function _add_log() { 
+	chain=$1
+	normal=$2 ; normalB=$3; 	Elog="2/hour"   ; ElogB=1;  # normal speed/bucket (from $1 $2) and alert-about-over-logging speed/bucket
+	flag=0x8000 # flag used to mark the branch that the packet is *NOT* logged too fast (if THIS $chain logging is used too fast)
+
+	iptab -A $chain  -m limit  --limit "$normal" --limit-burst "$normalB"   -j MARK --or-mark 0x8000   # mark
+	# say if it was too fast (but limit this allerting too):
+	iptab -A $chain  -m mark  ! --mark 0x8000/0x8000  -m limit --limit  "$Elog" --limit-burst "$ElogB"  -j LOG --log-prefix "fwSPAM_$chain: " --log-ip-options --log-tcp-options --log-uid
+	# else log it normally:
+	iptab -A $chain  -m mark    --mark 0x8000/0x8000   -j LOG --log-prefix "fw_$chain: " --log-ip-options --log-tcp-options --log-uid    # log at normal log-speed
+}
+
+function add_log() { 
+	_add_log "$1" "2/minute" "2"
+}
+function add_log_speed() { 
+	_add_log "$1" "$2" "$3"
+}
+
+# chains
+function make_reject_quiet() {
+	chain=$1
+	iptab -N $chain ; iptab -A $chain -j REJECT ;
+}
+
+function make_reject_after_log() {
+	chain=$1
+	iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j REJECT ;
+}
+function make_reject_after_log_speed() {
+	chain=$1
+	iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j REJECT ;
+}
+
+function make_stop() {
+	make_reject_after_log "S_$1"
+}
+function make_stop_speed() {
+	make_reject_after_log_speed "S_$1"  "$2"  "$3"
+}
+function make_stop_fast() {
+	make_reject_after_log_speed "S_$1"  "5/minute"  "10"
+}
+function make_stop_slow() {
+	make_reject_after_log_speed "S_$1"  "2/day"  "2"
+}
+
+
+
+function make_accept_quiet() {
+	chain=$1
+	iptab -N $chain ; iptab -A $chain -j ACCEPT ;
+}
+
+function make_accept_after_log() {
+	chain=$1
+	iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j ACCEPT ;
+}
+function make_accept_after_log_speed() {
+	chain=$1
+	iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j ACCEPT ;
+}
+
+function make_ok() {
+	make_accept_after_log "G_$1"
+}
+function make_ok_speed() {
+	make_accept_after_log_speed "G_$1"  "$2"  "$3"
+}
+function make_ok_fast() {
+	make_accept_after_log_speed "G_$1"  "5/minute"  "10"
+}
+function make_ok_slow() {
+	make_accept_after_log_speed "G_$1"  "2/day"  "2"
+}
+# === END of - the STATIC PART (library?) ==================================================================
+
+
+
+# === the DYNAMIC PART with configuration and script ==================================================================
+# configure some parts here as needed
+
+# *EDIT* configure me:  
+tor_html_proxy_port=8118       # configure. secret? TCP port on localhost used for isolated user HTTP. Eg 8118 privoxy. Remember to set privoxy to use TOR parent!!!
+lan_ip_mask="192.168.0.0/24"  # configure. secret? IP/mask of the LAN e.g. for allowing certain freenet nodes to go only to LAN (secret?)
+
+
+# TODO use this lists/make them real lists/arrays in bash
+# TODO this lists are NOT USED in this version of script, instead edit stuff below directly.
+# ALL THIS is secret; configure it.
+
+freenet_opennet_dev="eth+" #  Which device like usb0 to use for opennet connections. TODO(not used now, edit below instead)
+freenet_opennet_uid="srv_fn" #  Which unix-user(s) like "srv_fn" or 1002 will be running the opennet nodes  TODO(not used now, edit below instead)
+
+freenet_darknet_dev="eth+" #  Which device like eth+ to use for darknet connections. TODO(not used now, edit below instead)
+freenet_darknet_uid="" #  Which unix-user(s) like "srv_fn" or 1002 will be running the darknet nodes  TODO(not used now, edit below instead)
+
+speciall_dev="usb+" # do not use this device OUTPUT for anything else then allowed above (e.g. only as freenet-darknet device)
+
+freenet_ports_fproxy="8888:8899" #  Ports :TODO(not used now, edit below instead)
+freenet_ports_wrapper="8888:8899" #  Ports :TODO(not used now, edit below instead)
+freenet_ports_fcp="8888:8899" #  Ports :TODO(not used now, edit below instead)
+freenet_ports_fms="8888:8899" #  Ports :TODO(not used now, edit below instead)
+freenet_ports_nttp="8888:8899" #  Ports :TODO(not used now, edit below instead)
+
+yacy_uid="" # Which unix-user(s) like "srv_yact" ir 1003 will run the YACY server
+
+# lists are separated by space
+clients_freenet="rafal" #  TODO List of unix users that should generally use Freenet (connect to fproxy :8888, FMS etc) e.g. srv_fn_cli
+clients_yact="" # TODO List of unix users that should generally use YACY (connect to web interface of Yacy :8090 etc) srv_yacy_cli
+users_tor_only="" # List of unix users that will be isolated to only user TOR (or TOR http proxy like privoxy, CONFIGURE it to use TOR!)
+users_no_network="" # List of unix users that will not be allowed to use any network
+clients_user="rafal" # list of users that can access local secure services
+clients_user_locked="" # list of users that should access ONLY use local secure services
+
+clear_firewall # <--- ! 
+
+block_everything # <--- !
+
+# create general use targets:
+make_reject_after_log_speed "STOP"           "5/hour" "20"   # general
+make_reject_after_log_speed "STOP_all_o"     "5/hour" "20"   # unexpected outputs (not used probably)
+make_reject_after_log_speed "STOP_all_i"     "10/hour" "30"   # unexpected inputs (tune this down if directly interneted to avoid spam, esp if no NAT/firewall outside)
+make_reject_after_log_speed "STOP_invalid"   "5/hour" "20"
+make_reject_after_log_speed "STOP_invalid2"  "5/hour" "20"
+make_reject_after_log_speed "STOP_inspoof"  "5/hour" "20"
+
+#####################################################################
+#####################################################################
+# basic rules
+
+# established connections - continue them without extra filtering
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# kill invalid
+iptables -A INPUT  -m state --state INVALID -j STOP_invalid
+iptables -A OUTPUT -m state --state INVALID -j STOP_invalid2
+
+# kill spoof
+# configure this. secret (a bit?)
+chain=VERIFY_inspoof
+	iptab -N $chain 
+	# configure. secret?  List what device can have what IP address. Read "man iptables" manual, or
+	# echo "NO SPOOF PROTECTION HERE (configure me)" ; iptab -j RETURN # <---- ...or use this to allow everything and turn spoof protection off
+
+	 iptab -A $chain  -d 239.255.255.250 -p udp --dport 1900 -j RETURN  # the discovery SSDP (multicast) protocol
+	 iptab -A $chain  -d 224.0.0.0/4 -j RETURN  # general multicast group D
+	 iptab -A $chain  -d 255.255.255.255 -j RETURN  # multicast to any
+
+	 iptab -A $chain  -i lo    -d 127.0.0.1/8  -j RETURN  # this always
+	 iptab -A $chain  -i lo    -d 192.168.0.0/16  -j RETURN  # this always... isnt there a better way? used when src==dst
+
+	 iptab -A $chain  -i eth+  -d 192.168.0.0/24  -j RETURN # configure. secret? TODO
+	 iptab -A $chain  -i usb+  -d 192.168.0.0/24  -j RETURN # configure. secret? TODO
+
+	iptab -A $chain -j STOP_inspoof # else (all not listed) is a spoof!
+# end
+
+iptables -A INPUT  -j VERIFY_inspoof 
+
+# no need for out-spoof protection, routing/kernel does it? 
+
+
+#####################################################################
+#####################################################################
+# speciall allowing
+# allow here any isolated users e.g. to access given services 
+
+# secret / configure  
+# user=1009 ;  iptab  -A OUTPUT  -d 127.0.0.1 -p tcp --dport 80 -m owner --uid-owner $user  -j ACCEPT # secret/configure
+# user=1009 ;  iptab  -A OUTPUT  -d 192.168.0.1 -p udp --dport 53 -m owner --uid-owner $user  -j ACCEPT # secret/configure DNS
+# user=1009 ;  iptab  -A OUTPUT  -d 192.168.0.123 -p tcp --dport 5022 -m owner --uid-owner $user  -j ACCEPT # secret/configure SSH
+
+#####################################################################
+#####################################################################
+# speciall isolations. e.g. confine given unix user account to only use TOR, or no network (outside localhost etc) at al
+#######################################
+
+# LOCAL only - things isolate to work only on local, e.g. users isolated from LAN/internet
+# local isolated user:
+# *EDIT* ID of user(s) that can go anywhere only using TOR (EXCEPT things allowed above).
+make_stop "only_TOR"
+for user in "$users_tor_only" ; do if [[ ! -z "$user" ]] ; then
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport "$tor_html_proxy_port" -j ACCEPT # via proxy
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport 9050 -j ACCEPT # directly tor
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -j S_only_TOR
+fi ; done
+
+make_stop "no_network"
+for user in "$users_no_network" ; do if [[ ! -z "$user" ]] ; then
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -j S_no_network
+fi ; done
+
+#####################################################################
+#####################################################################
+
+echo "allow other services - EARLY"
+make_ok_fast "i2pirc" ; iptab  -A INPUT -i lo -p tcp --dport 6668 -j G_i2pirc
+
+#####################################################################
+#####################################################################
+# PROTECTED-SERVICES - GENERAL CONNECTIVITY 
+
+#####################################################################
+### FREENET
+
+# prepare list of allowed peers:
+chain=freenet_peer_INTERNET 
+	iptab -N $chain 
+	# configure - list here the IP:PORT pairs of freenet friend nodes you allow to connect to
+	# use normal iptables format or rules (read man page!) you can use netmask like 1.2.3.4/24
+	# you probably want to NOT SHARE THIS LIST if sharing this firewall script!
+	# EXAMPLE: iptab -A $chain  -d 1.1.1.1  -p udp --dport 1  -j ACCEPT # private secret
+	 iptab_hidden -A $chain  -d 192.168.0.201/24  -p udp --dport 4040  -j ACCEPT # private secret! p1
+	 iptab_hidden -A $chain  -d 192.168.0.201/24  -p udp --dport 4040  -j ACCEPT # private secret! p2
+	  # *** FILL IN MORE PEERS ***
+		
+	iptab -A $chain -j DROP # else drop it
+# end
+
+# prepare list of allowed peers:
+chain=freenet_peer_LAN
+	iptab -N $chain 
+	# secret if you edit this rule(s) below, by default the examples is very liberal:
+#	 iptab_hidden -A $chain  -d 192.168.0.0/16   -p udp   -j ACCEPT # private secret - OPEN RULE - just accept all private lan C on any port.
+	 iptab_hidden -A $chain  -d 192.168.0.0/16   -p udp   -j ACCEPT # private secret - OPEN RULE - just accept all private lan C on any port.
+	# be carefull with network 10.x.x.x sometimes TOR mappings can use it, or VPN etc. Better be more detailed here like 192.168.42.0/24 
+	# Narrow mask /24 is better then wide /16
+	iptab -A $chain -j DROP # else drop it
+# end
+
+# prepare list of allowed peers:
+chain=freenet_peer_LOCAL
+	iptab -N $chain 
+	# secret if you edit this rule(s) below, by default the examples is very liberal:
+	 iptab_hidden -A $chain  -o lo   -p udp   -j ACCEPT # private secret - OPEN RULE - just accept the localhost on ANY PORT.
+	iptab -A $chain -j DROP # else drop it
+# end
+
+#####################################################################
+# any opennet/darknet freenet node - need to open up the wrapper port (if using wrapper)
+for user in "$freenet_opennet_uid $freenet_darknet_uid" ; do if [[ ! -z "$user" ]] ; then
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -o lo  -d 127.0.0.1  -p tcp   -j ACCEPT   # TODO: limit the 32000? wrapper port(s) XXX
+fi ; done
+
+#####################################################################
+# opennet (or hybrid) nodes - do not limit to peer IPs. Maybe limit to a device name (e.g. usb0 to use modem)
+# OUTGOING opennet
+cnt=0 # H_freenet_... # TODO automatic counters
+
+for user in "$freenet_opennet_uid" ; do if [[ ! -z "$user" ]] ; then
+	device="$freenet_opennet_dev" # <--- configure ethernet device name. TODO-bash: allow entering "" as any device by skipping the -o ... below
+	echo "Freenet: allow node $user to use only either eth=$device or LAN=$lan_ip_mask"
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -o $device   -j ACCEPT   # allow (also) to this network device
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -d "$lan_ip_mask"  -j ACCEPT  # allow (also) to LAN
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -d 127.0.0.1 -j ACCEPT  # allow (also) to local
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -o lo -j ACCEPT  # allow (also) to local
+
+	cnt=$((cnt+1)) ; make_stop_slow "H_freenet_$cnt" ; stop="S_H_freenet_$cnt"
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -j S_H_freenet_$cnt  # else block
+fi ; done
+
+make_stop "spec_dev"
+iptab  -A OUTPUT  -o "$speciall_dev"  -j S_spec_dev
+# darknet nodes - do limit to only listed peer IPs. Maybe also limit to a device name
+# OUTGOING DARKNET
+for user in "$freenet_darknet_uid" ; do if [[ ! -z "$user" ]] ; then
+	device="$freenet_darknet_dev" # <--- configure ethernet device name. TODO-bash: allow entering "" as any device by skipping the -o ... below
+	echo "Freenet: allow node $user to use only either eth=$device or LAN=$lan_ip_mask, BUT ALSO LIMIT target IPs/PORTs"
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -o $device   -j freenet_peer_INTERNET
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -d "$lan_ip_mask"  -j freenet_peer_LAN
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -d 127.0.0.1 -j freenet_peer_LOCAL
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -o lo -j freenet_peer_LOCAL
+	cnt=$((cnt+1)) ; make_stop_slow "H_freenet_$cnt" ; stop="S_H_freenet_$cnt"
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -j S_H_freenet_$cnt  # else block
+fi ; done
+
+# INGOING DARKNET
+for port in "$freenet_ports" ; do if [[ ! -z "$user" ]] ; then
+	iptab  -A INPUT  -p udp --dport $port  -j ACCEPT # list of in general all ports that are opened because of freenet server
+fi ; done
+
+#####################################################################
+#####################################################################
+# protected-services access from local
+
+if [[ 1 -eq 1 ]]
+then # TODO disabled
+echo "CLIENTS allowed to talk to local darknet"
+# Freenet 
+# allow: ALL this users-clients to freenet/fms/nntp. Usually srv_fn_cli
+for user in "$clients_user" ; do if [[ ! -z "$user" ]] ; then
+	iptab  -A OUTPUT -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport 8888:8899 -j ACCEPT # FRED
+	iptab  -A OUTPUT -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport 9481:9483 -j ACCEPT # FCP (for e.g. jSite?)
+	iptab  -A OUTPUT -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport 8080:8089 -j ACCEPT # FMS
+	for port in 1119 1123 1129 ; # all NNTP servers
+	do
+		iptab  -A OUTPUT -m owner --uid-owner $user -d 127.0.0.1/24  -p tcp --dport $port -j ACCEPT
+	done
+	iptab  -A OUTPUT -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport 6667:6668 -j ACCEPT # FLIP/IRC
+fi ; done
+
+# allow: FMS servers to use FCP (and to use NTTP?)
+for user in "" ; do if [[ ! -z "$user" ]] ; then  # TODO add users
+	iptab  -A OUTPUT -m owner --uid-owner $user   -d 127.0.0.1/24  -p tcp --dport 9481:9483 -j ACCEPT
+	for port in 1119 1123 1129 ; # all NNTP (TODO is this needed?)
+	do
+		iptab  -A OUTPUT -m owner --uid-owner $user -d 127.0.0.1/24  -p tcp --dport $port -j ACCEPT
+	done
+fi ; done
+
+# allow: FLIP servers to use FCP
+# for user in srv_fn_flip # <--- configure unix user name of the FMS server user(s)
+for user in "" ; do if [[ ! -z "$user" ]] ; then  # TODO add users
+	iptab  -A OUTPUT -m owner --uid-owner $user   -d 127.0.0.1/24  -p tcp --dport 9481:9483 -j ACCEPT
+fi ; done
+
+fi # block
+
+#####################################################################
+### YACY
+
+if [[ 0 -eq 1 ]]
+then # TODO disabled
+iptab  -A OUTPUT -m owner --uid-owner srv_yacy_cli  -d 127.0.0.1  -p tcp --dport 8090 -j ACCEPT
+
+# YACY isolated to TOR and TOR_HMTL proxy
+# hold YACY:
+make_stop "H_yacy"
+make_stop_slow "Hign_yacy"
+iptab  -A OUTPUT -m owner --uid-owner srv_yacy  -d 127.0.0.1/24  -p tcp --dport "$tor_html_proxy_port" -j ACCEPT  # YACY can use TOR
+iptab  -A OUTPUT -m owner --uid-owner srv_yacy  -d 127.0.0.1/24  -p tcp --dport 9050 -j ACCEPT  # YACY can use TOR
+iptab  -A OUTPUT -m owner --uid-owner srv_yacy  -p udp --dport 53 -j S_Hign_yacy # ignore DNS attempts
+iptab  -A OUTPUT -m owner --uid-owner srv_yacy  -j S_H_yacy
+
+fi # TODO disabled
+
+#####################################################################
+# LOCK DOWN _cli users
+# the client users should use ONLY the protected-services
+cnt=0
+for user in "$clients_user_locked" ; do if [[ ! -z "$user" ]] ; then
+	echo "Locking down client user: $user"
+	#iptab  -A OUTPUT  -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport "$tor_html_proxy_port" -j ACCEPT
+	#iptab  -A OUTPUT  -m owner --uid-owner $user  -d 127.0.0.1/24  -p tcp --dport 9050 -j ACCEPT 
+	cnt=$((cnt+1)) ; make_stop "only_myserv_$cnt" ; stop="S_only_myserv_$cnt"
+	iptab  -A OUTPUT  -m owner --uid-owner $user  -j ${stop}
+fi ; done
+
+#####################################################################
+#####################################################################
+# FINALLY - block other access to protected-services
+
+# block from inside, block: local-unauthorized---->PROTECTED   e.g. connecting locally from BAD USER to protected-service
+make_stop_fast "PROT_out_yacy"    ;  iptab  -A OUTPUT -d 127.0.0.1/24  -p tcp --dport 8090:8090 -j S_PROT_out_yacy   # Yacy
+make_stop_fast "PROT_out_fcp"     ;  iptab  -A OUTPUT -d 127.0.0.1/24  -p tcp --dport 9481:9489 -j S_PROT_out_fcp    # Freenet FCP
+make_stop_fast "PROT_out_fproxy"  ;  iptab  -A OUTPUT -d 127.0.0.1/24  -p tcp --dport 8888:8899 -j S_PROT_out_fproxy # Freenet FProxy
+make_stop_fast "PROT_out_fms"     ;  iptab  -A OUTPUT -d 127.0.0.1/24  -p tcp --dport 8080:8085 -j S_PROT_out_fms    # Freenet FMS
+make_stop_fast "PROT_out_fnttp"   ;  iptab  -A OUTPUT -d 127.0.0.1/24  -p tcp --dport 1000:2000 -j S_PROT_out_fnttp  # Freenet NNTP
+### make_stop_fast "PROT_out_flip"    ;  iptab  -A OUTPUT -d 127.0.0.1/24  -p tcp --dport 6667:6668 -j S_PROT_out_flip   # IRC (Freenet/FLIP and I2P/IRC2P) TODO
+# TODO freeenet wrapper
+
+# block from outside, block any external connections to the local-only protected services
+# all connections that come from lo (lo->lo connection) are allowed (in the rules below as lo->lo allow) because
+# authoriztion of lo->lo based on the user (client) is done above. So if here connection from lo into given lo port is still
+# not blocked, then it was valid. So now just kill possible not-lo connections to this ports.
+make_stop "PROT_in_yacy"    ;  iptab  -A INPUT ! -i lo -p tcp --dport 8090:8090 -j S_PROT_in_yacy   # Yacy
+make_stop "PROT_in_fcp"     ;  iptab  -A INPUT ! -i lo -p tcp --dport 9481:9489 -j S_PROT_in_fcp    # Freenet FCP
+make_stop "PROT_in_fproxy"  ;  iptab  -A INPUT ! -i lo -p tcp --dport 8888:8899 -j S_PROT_in_fproxy # Freenet FProxy
+make_stop "PROT_in_fms"     ;  iptab  -A INPUT ! -i lo -p tcp --dport 8080:8085 -j S_PROT_in_fms    # Freenet FMS
+make_stop "PROT_in_fnttp"   ;  iptab  -A INPUT ! -i lo -p tcp --dport 1000:2000 -j S_PROT_in_fnttp  # Freenet NNTP
+# make_stop "PROT_in_flip"    ;  iptab  -A INPUT ! -i lo -p tcp --dport 6667:6668 -j S_PROT_in_flip   # IRC (Freenet/FLIP and I2P/IRC2P)
+# TODO freeenet wrapper
+
+
+#####################################################################
+#####################################################################
+
+echo "allow other services"
+### make_ok_fast "i2pirc" ; iptab  -A INPUT -i lo -p tcp --dport 6668 -j G_i2pirc # DUPLICTED
+
+#####################################################################
+#####################################################################
+# finishing rules
+
+# usually allow LO-LO:
+iptab  -A OUTPUT  -o lo -j ACCEPT
+iptab  -A INPUT   -i lo -j ACCEPT
+
+# allow most output
+iptab  -A OUTPUT  -j ACCEPT
+
+
+#####################################################################
+#####################################################################
+### OTHER INPUTS
+
+make_stop_slow "ssdp"       ; iptab -A INPUT -d 239.255.255.250 -p udp --dport 1900 -j S_ssdp  # SSDP multicast protocol
+make_stop_slow "multicast"  ; iptab -A INPUT -d 224.0.0.0/4 -j S_multicast # multicast
+make_stop_slow "multicastZ" ; iptab -A INPUT -d 255.255.255.255 -j S_multicast # multicast to any
+
+# deny the rest of inputs into us (access to unexpected/unopened services)
+# this rule is probably the most used general "firewall stuff" rule used and will be hit a lot
+# unless you already have external firewall/NAT)
+iptab  -A INPUT   -j STOP_all_i
+
+echo "Firewall ready, enabling"
+
+block_everything_undo # !
+
+echo "Firewall done."
+
+
+
+
