@@ -144,69 +144,27 @@ function _add_log() {
 	iptab -A $chain  -m mark    --mark 0x8000/0x8000   -j LOG --log-prefix "fw_$chain: " --log-ip-options --log-tcp-options --log-uid    # log at normal log-speed
 }
 
-function add_log() { 
-	_add_log "$1" "2/minute" "2"
-}
-function add_log_speed() { 
-	_add_log "$1" "$2" "$3"
-}
+function add_log() { _add_log "$1" "2/minute" "2" ; }
+function add_log_speed() { _add_log "$1" "$2" "$3" ; }
 
 # chains
-function make_reject_quiet() {
-	chain=$1
-	iptab -N $chain ; iptab -A $chain -j REJECT ;
-}
+function make_reject_quiet() {	chain=$1 ; iptab -N $chain ; iptab -A $chain -j REJECT ; }
+function make_reject_after_log() {	chain=$1 ; iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j REJECT ; }
+function make_reject_after_log_speed() {	chain=$1 ; iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j REJECT ; }
 
-function make_reject_after_log() {
-	chain=$1
-	iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j REJECT ;
-}
-function make_reject_after_log_speed() {
-	chain=$1
-	iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j REJECT ;
-}
+function make_stop() { 	make_reject_after_log "S_$1" ; }
+function make_stop_speed() { 	make_reject_after_log_speed "S_$1"  "$2"  "$3" ; }
+function make_stop_fast() { 	make_reject_after_log_speed "S_$1"  "5/minute"  "10" ; }
+function make_stop_slow() { 	make_reject_after_log_speed "S_$1"  "2/day"  "2"; }
 
-function make_stop() {
-	make_reject_after_log "S_$1"
-}
-function make_stop_speed() {
-	make_reject_after_log_speed "S_$1"  "$2"  "$3"
-}
-function make_stop_fast() {
-	make_reject_after_log_speed "S_$1"  "5/minute"  "10"
-}
-function make_stop_slow() {
-	make_reject_after_log_speed "S_$1"  "2/day"  "2"
-}
+function make_accept_quiet() { chain=$1 ; iptab -N $chain ; iptab -A $chain -j ACCEPT ; }
+function make_accept_after_log() { chain=$1 ; iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j ACCEPT ; }
+function make_accept_after_log_speed() { chain=$1 ; iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j ACCEPT ; }
 
-
-
-function make_accept_quiet() {
-	chain=$1
-	iptab -N $chain ; iptab -A $chain -j ACCEPT ;
-}
-
-function make_accept_after_log() {
-	chain=$1
-	iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j ACCEPT ;
-}
-function make_accept_after_log_speed() {
-	chain=$1
-	iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j ACCEPT ;
-}
-
-function make_ok() {
-	make_accept_after_log "G_$1"
-}
-function make_ok_speed() {
-	make_accept_after_log_speed "G_$1"  "$2"  "$3"
-}
-function make_ok_fast() {
-	make_accept_after_log_speed "G_$1"  "5/minute"  "10"
-}
-function make_ok_slow() {
-	make_accept_after_log_speed "G_$1"  "2/day"  "2"
-}
+function make_ok() { make_accept_after_log "G_$1" ; }
+function make_ok_speed() {  make_accept_after_log_speed "G_$1"  "$2"  "$3" ; }
+function make_ok_fast() { make_accept_after_log_speed "G_$1"  "5/minute"  "10" ; }
+function make_ok_slow() { make_accept_after_log_speed "G_$1"  "2/day"  "2" ; }
 # === END of - the STATIC PART (library?) ==================================================================
 
 
