@@ -147,7 +147,6 @@ function _add_log() {
 function add_log() { _add_log "$1" "2/minute" "2" ; }
 function add_log_speed() { _add_log "$1" "$2" "$3" ; }
 
-# chains
 function make_reject_quiet() {	chain=$1 ; iptab -N $chain ; iptab -A $chain -j REJECT ; }
 function make_reject_after_log() {	chain=$1 ; iptab -N $chain ; add_log "$chain" ; iptab -A $chain -j REJECT ; }
 function make_reject_after_log_speed() {	chain=$1 ; iptab -N $chain ; add_log_speed "$chain" "$2" "$3" ; iptab -A $chain -j REJECT ; }
@@ -165,6 +164,43 @@ function make_ok() { make_accept_after_log "G_$1" ; }
 function make_ok_speed() {  make_accept_after_log_speed "G_$1"  "$2"  "$3" ; }
 function make_ok_fast() { make_accept_after_log_speed "G_$1"  "5/minute"  "10" ; }
 function make_ok_slow() { make_accept_after_log_speed "G_$1"  "2/day"  "2" ; }
+
+
+# same but for ipv6
+
+
+function _add6_log() { 
+	chain=$1
+	normal=$2 ; normalB=$3; 	Elog="2/hour"   ; ElogB=1;  # normal speed/bucket (from $1 $2) and alert-about-over-logging speed/bucket
+	flag=0x8000 # flag used to mark the branch that the packet is *NOT* logged too fast (if THIS $chain logging is used too fast)
+	iptab6 -A $chain  -m limit  --limit "$normal" --limit-burst "$normalB"   -j MARK --or-mark 0x8000   # mark
+	# say if it was too fast (but limit this allerting too):
+	iptab6 -A $chain  -m mark  ! --mark 0x8000/0x8000  -m limit --limit  "$Elog" --limit-burst "$ElogB"  -j LOG --log-prefix "fwSPAM_$chain: " --log-ip-options --log-tcp-options --log-uid
+	# else log it normally:
+	iptab6 -A $chain  -m mark    --mark 0x8000/0x8000   -j LOG --log-prefix "fw_$chain: " --log-ip-options --log-tcp-options --log-uid    # log at normal log-speed
+}
+
+function add6_log() { _add6_log "$1" "2/minute" "2" ; }
+function add6_log_speed() { _add6_log "$1" "$2" "$3" ; }
+
+function make6_reject_quiet() {	chain=$1 ; iptab6 -N $chain ; iptab6 -A $chain -j REJECT ; }
+function make6_reject_after_log() {	chain=$1 ; iptab6 -N $chain ; add6_log "$chain" ; iptab6 -A $chain -j REJECT ; }
+function make6_reject_after_log_speed() {	chain=$1 ; iptab6 -N $chain ; add6_log_speed "$chain" "$2" "$3" ; iptab6 -A $chain -j REJECT ; }
+
+function make6_stop() { 	make6_reject_after_log "Sv6_$1" ; }
+function make6_stop_speed() { 	make6_reject_after_log_speed "Sv6_$1"  "$2"  "$3" ; }
+function make6_stop_fast() { 	make6_reject_after_log_speed "Sv6_$1"  "5/minute"  "10" ; }
+function make6_stop_slow() { 	make6_reject_after_log_speed "Sv6_$1"  "2/day"  "2"; }
+
+function make6_accept_quiet() { chain=$1 ; iptab6 -N $chain ; iptab6 -A $chain -j ACCEPT ; }
+function make6_accept_after_log() { chain=$1 ; iptab6 -N $chain ; add6_log "$chain" ; iptab6 -A $chain -j ACCEPT ; }
+function make6_accept_after_log_speed() { chain=$1 ; iptab6 -N $chain ; add6_log_speed "$chain" "$2" "$3" ; iptab6 -A $chain -j ACCEPT ; }
+
+function make6_ok() { make6_accept_after_log "Gv6_$1" ; }
+function make6_ok_speed() {  make6_accept_after_log_speed "Gv6_$1"  "$2"  "$3" ; }
+function make6_ok_fast() { make6_accept_after_log_speed "Gv6_$1"  "5/minute"  "10" ; }
+function make6_ok_slow() { make6_accept_after_log_speed "Gv6_$1"  "2/day"  "2" ; }
+
 # === END of - the STATIC PART (library?) ==================================================================
 
 
@@ -172,45 +208,12 @@ function make_ok_slow() { make_accept_after_log_speed "G_$1"  "2/day"  "2" ; }
 # === the DYNAMIC PART with configuration and script ==================================================================
 # configure some parts here as needed
 
-# *EDIT* configure me:  
-tor_html_proxy_port=8118       # configure. secret? TCP port on localhost used for isolated user HTTP. Eg 8118 privoxy. Remember to set privoxy to use TOR parent!!!
-tor_socks_port=9050 # the TOR socks port, usually 90050
+source "/etc/mempofirewall/conf/main.sh"
 
-# your network - configure this if needed (e.g. make the rules more tight)
-lan_ip_mask="192.168.0.0/24"  # configure. secret? IP/mask of the primary LAN e.g. for allowing certain freenet nodes to go only to LAN (secret?)
-net_allow_ip_for_eth="192.168.0.0/16" # ip/mask that are allowed to come from eth+
-net_allow_ip_for_usb="192.168.0.0/16"
-net_allow_ip_for_wlan="192.168.0.0/16"
-net_allow_ip_for_tun0="10.0.0.0/8"
-net_allow_ip_for_tun1="10.0.0.0/8"
-
-# TODO use this lists/make them real lists/arrays in bash
-# TODO this lists are NOT USED in this version of script, instead edit stuff below directly.
-# ALL THIS is secret; configure it.
-
-freenet_opennet_dev="eth+" #  Which device like usb0 to use for opennet connections. TODO(not used now, edit below instead)
-freenet_opennet_uid="srv_fn" #  Which unix-user(s) like "srv_fn" or 1002 will be running the opennet nodes  TODO(not used now, edit below instead)
-
-freenet_darknet_dev="eth+" #  Which device like eth+ to use for darknet connections. TODO(not used now, edit below instead)
-freenet_darknet_uid="" #  Which unix-user(s) like "srv_fn" or 1002 will be running the darknet nodes  TODO(not used now, edit below instead)
-
-speciall_dev="usb+" # do not use this device OUTPUT for anything else then allowed above (e.g. only as freenet-darknet device)
-
-freenet_ports_fproxy="8888:8899" #  Ports :TODO(not used now, edit below instead)
-freenet_ports_wrapper="8888:8899" #  Ports :TODO(not used now, edit below instead)
-freenet_ports_fcp="8888:8899" #  Ports :TODO(not used now, edit below instead)
-freenet_ports_fms="8888:8899" #  Ports :TODO(not used now, edit below instead)
-freenet_ports_nttp="8888:8899" #  Ports :TODO(not used now, edit below instead)
-
-yacy_uid="" # Which unix-user(s) like "srv_yact" ir 1003 will run the YACY server
-
-# lists are separated by space
-clients_freenet="rafal srv_keepalive" #  TODO List of unix users that should generally use Freenet (connect to fproxy :8888, FMS etc) e.g. srv_fn_cli
-clients_yact="" # TODO List of unix users that should generally use YACY (connect to web interface of Yacy :8090 etc) srv_yacy_cli
-users_tor_only="" # isolated: List of unix users that will be isolated to only user TOR (or TOR http proxy like privoxy, CONFIGURE it to use TOR!)
-users_no_network="" # isolated: List of unix users that will not be allowed to use any network
-clients_user="rafal" # list of users that can access local secure services
-clients_user_locked="" # isolated: list of users that should access ONLY use local secure services
+for f in $(ls -1 /etc/mempofirewall/conf-priv/*.sh) 
+do
+	source "$f"
+done
 
 clear_firewall # <--- ! 
 
@@ -224,8 +227,10 @@ make_reject_after_log_speed "STOP_all_i"     "1/hour" "3"  # unexpected inputs (
 # part_0100: basic rules
 
 # established connections - continue them without extra filtering
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptab -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptab -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptab6 -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptab6 -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 # kill invalid
 make_reject_after_log_speed "STOP_invalidI"  "1/hour" "3"
@@ -505,15 +510,25 @@ make_stop_slow "ssdp"       ; iptab -A INPUT -d 239.255.255.250 -p udp --dport 1
 make_stop_slow "multicast"  ; iptab -A INPUT -d 224.0.0.0/4 -j S_multicast # multicast
 make_stop_slow "multicastZ" ; iptab -A INPUT -d 255.255.255.255 -j S_multicast # multicast to any
 
+for f in $(ls -1 /etc/mempofirewall/rules.d/8??-*.sh) 
+do
+	source "$f"
+done
+
 # deny the rest of inputs into us (access to unexpected/unopened services)
 # this rule is probably the most used general "firewall stuff" rule used and will be hit a lot
 # unless you already have external firewall/NAT)
 iptab  -A INPUT   -j STOP_all_i
+
+make6_reject_after_log_speed "STOP6_all_i"     "1/hour" "3"  
+iptab6  -A INPUT   -j STOP6_all_i
+
 
 echo "Firewall ready, enabling"
 
 block_everything_undo # !
 
 echo "Firewall done."
+
 
 
